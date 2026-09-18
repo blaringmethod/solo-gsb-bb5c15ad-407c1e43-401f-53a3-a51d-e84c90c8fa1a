@@ -1,6 +1,6 @@
-# JSON Merge & Patch Service
+# JSON Merge, Patch & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供两个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供三个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -8,6 +8,9 @@
 - `POST /patch`：接收 `document` 与 `operations`，按数组顺序在**深拷贝**上原子
   执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch 的
   `add`、`remove`、`replace`、`test` 操作。
+- `POST /canonicalize`：接收任意 JSON `document`，按
+  [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)（JCS）生成无空白、确定性的
+  规范 JSON 文本，并返回其 SHA-256 摘要。
 
 ## 快速开始
 
@@ -160,6 +163,45 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `~`（先解 `~1` 再解 `~0`）。空字符串 `""` 指向整个文档。例如键 `a/b`写作
 `/a~1b`，键 `~x` 写作 `/~0x`。
 
+### `POST /canonicalize`
+
+请求体只含一个字段，`document` 可以是**任意 JSON 值**（对象、数组、标量、甚至
+根级别的 `null`/数字/字符串）：
+
+```json
+{ "document": { "b": 1, "a": [null, true, 1000000000000000000000], "€": 4.5 } }
+```
+
+**成功 → `200`**，返回规范文本及其 SHA-256（对规范文本的 UTF-8 字节取摘要）：
+
+```json
+{
+  "canonical": "{\"a\":[null,true,1e+21],\"b\":1,\"€\":4.5}",
+  "sha256": "aa1895e4836931e94f127911ca20cbf5ec60684dbf980edd11b91ba0a98dd7e9"
+}
+```
+
+规范化严格遵循 RFC 8785（JSON Canonicalization Scheme）：
+
+| 规则       | 说明                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| 空白       | 不输出任何空白字符，单行输出                                                                                                      |
+| 对象键排序 | 递归排序；键名按 **UTF-16 码元**（无符号 16 位整数）逐码元比较，空串/前缀短者排前；与 Unicode 码点序在辅助平面字符上不同          |
+| 数组       | 元素顺序保持不变（但其中嵌套对象仍会排序）                                                                                        |
+| 数字       | ECMAScript `Number.prototypeToString`（最短往返）表示：`-0` 输出 `0`；`1e21` 输出 `1e+21`，`1e20` 仍为定长；指数不补零（`5e-324`） |
+| 字符串     | 仅做必要转义：`"` → `\"`、`\` → `\\`、控制字符用 `\b \t \n \f \r` 或小写 `\uhhhh`；`/`、`'`、非 ASCII（如 `€`、emoji）原样输出 UTF-8 |
+| 布尔/null  | 输出 `true` / `false` / `null`，且 `true` 不等同于 `1`                                                                            |
+
+同一份文档（无论原始键序、空白或数字写法如何）必然得到**字节完全相同**的规范
+文本和 SHA-256，可直接用于签名、去重与完整性校验。
+
+**缺少 `document` 字段或请求体无法解析为 JSON → `422`**；文档能解析但包含
+JCS 不允许的值（如超出 IEEE 754 double 范围的整数）同样返回 `422`：
+
+```json
+{ "detail": "document cannot be canonicalized", "reason": "..." }
+```
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -201,6 +243,17 @@ curl -s -X POST http://localhost:8000/patch \
   -H 'Content-Type: application/json' \
   -d '{"document":{"a":1},"operations":[{"op":"add","path":"/b","value":2},{"op":"test","path":"/a","value":99}]}'
 # => 409 {"detail":"patch conflict","failed_index":1,"path":"/a","reason":"test failed: ..."}
+
+# RFC 8785 规范化（键排序 + 确定性数字 + 仅必要转义）
+curl -s -X POST http://localhost:8000/canonicalize \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"z":1,"a":["€\n",null,false],"n":1e21}}'
+# => {"canonical":"{\"a\":[\"€\\n\",null,false],\"n\":1e+21,\"z\":1}","sha256":"c5b1bd7f8dc067ea4a691fdc8edf37c90e4bf05234918d943d9b3d9ee993b061"}
+
+# 缺少 document 字段 → 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/canonicalize \
+  -H 'Content-Type: application/json' -d '{}'
+# => 422
 ```
 
 ## 测试
@@ -213,11 +266,13 @@ pytest
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：/merge 三方合并与 /patch 入口
-app/patch.py         # RFC 6902 JSON Patch 校验与原子执行
-app/jsonutil.py      # JSON 相等性与 MISSING 哨兵（两个接口共用）
-tests/test_merge.py  # /merge 测试
-tests/test_patch.py  # /patch 测试
+app/main.py           # FastAPI 应用：/merge、/patch 与 /canonicalize 入口
+app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
+app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
+app/jsonutil.py       # JSON 相等性与 MISSING 哨兵（接口共用）
+tests/test_merge.py        # /merge 测试
+tests/test_patch.py        # /patch 测试
+tests/test_canonicalize.py # /canonicalize 测试
 requirements.txt     # 运行依赖（Docker 构建时自动安装）
 requirements-dev.txt # 测试依赖
 Dockerfile
