@@ -1,6 +1,6 @@
-# JSON Merge & Patch Service
+# JSON Merge, Patch & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供两个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供三个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -8,6 +8,9 @@
 - `POST /patch`：接收 `document` 与 `operations`，按数组顺序在**深拷贝**上原子
   执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch 的
   `add`、`remove`、`replace`、`test` 操作。
+- `POST /canonicalize`：接收任意 JSON `document`，按
+  [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)（JCS）生成无空白、确定性
+  的规范 JSON 文本，返回规范文本及其 UTF-8 字节的 SHA-256。
 
 ## 快速开始
 
@@ -160,6 +163,53 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `~`（先解 `~1` 再解 `~0`）。空字符串 `""` 指向整个文档。例如键 `a/b`写作
 `/a~1b`，键 `~x` 写作 `/~0x`。
 
+### `POST /canonicalize`
+
+请求体：
+
+| 字段       | 类型      | 说明           |
+| ---------- | --------- | -------------- |
+| `document` | 任意 JSON | 待规范化的文档 |
+
+```json
+{
+  "document": { "b": 1.0, "a": [true, null, "€"] }
+}
+```
+
+**成功 → `200`**，返回规范文本与其 UTF-8 字节的 SHA-256（小写十六进制）：
+
+```json
+{
+  "canonical": "{\"a\":[true,null,\"€\"],\"b\":1}",
+  "sha256": "a8e7a9d6759858c29245704de07c916819f73a458277666934746be715c57c54"
+}
+```
+
+规范化规则（RFC 8785 / JCS）：
+
+- **对象键**按 UTF-16 码元字典序排列（注意与码点顺序不同：非 BMP 字符按
+  代理对参与比较，如 `𐀀` U+10000 排在 `￿` U+FFFF 之前）；
+- **数字**采用 ECMAScript `Number::toString` 规范表示：`1.0` → `1`、
+  `-0` → `0`、`1e30` → `1e+30`、`0.0000001` → `1e-7`，整数与浮点写法
+  相同的数得到相同文本；
+- **字符串**只使用必要转义：`\"`、`\\`、`\b`、`\t`、`\n`、`\f`、`\r`，
+  其余控制字符用 `\u00xx`（小写十六进制）；非 ASCII 字符（如 `€`、emoji）
+  一律原样输出；
+- **布尔 / null** 输出为 `true` / `false` / `null`，**数组**保持原有顺序；
+- 输出不含任何空白。同一文档无论键顺序、数字写法如何，始终得到字节完全
+  相同的文本与 SHA-256。
+
+缺少 `document` 字段、请求体不是合法 JSON、或文档无法规范化（字符串含孤立
+代理项、数字超出 IEEE 754 双精度范围）→ `422`：
+
+```json
+{
+  "detail": "document cannot be canonicalized",
+  "reason": "number outside the IEEE 754 double range"
+}
+```
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -201,6 +251,12 @@ curl -s -X POST http://localhost:8000/patch \
   -H 'Content-Type: application/json' \
   -d '{"document":{"a":1},"operations":[{"op":"add","path":"/b","value":2},{"op":"test","path":"/a","value":99}]}'
 # => 409 {"detail":"patch conflict","failed_index":1,"path":"/a","reason":"test failed: ..."}
+
+# RFC 8785 规范化：键排序 + 数字规范形式 + SHA-256
+curl -s -X POST http://localhost:8000/canonicalize \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"b":1.0,"a":[true,null,"€"]}}'
+# => {"canonical":"{\"a\":[true,null,\"€\"],\"b\":1}","sha256":"a8e7a9d6..."}
 ```
 
 ## 测试
@@ -213,13 +269,15 @@ pytest
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：/merge 三方合并与 /patch 入口
-app/patch.py         # RFC 6902 JSON Patch 校验与原子执行
-app/jsonutil.py      # JSON 相等性与 MISSING 哨兵（两个接口共用）
-tests/test_merge.py  # /merge 测试
-tests/test_patch.py  # /patch 测试
-requirements.txt     # 运行依赖（Docker 构建时自动安装）
-requirements-dev.txt # 测试依赖
+app/main.py             # FastAPI 应用：/merge、/patch、/canonicalize 入口
+app/patch.py            # RFC 6902 JSON Patch 校验与原子执行
+app/canonical.py        # RFC 8785 (JCS) 规范化序列化
+app/jsonutil.py         # JSON 相等性与 MISSING 哨兵（/merge 与 /patch 共用）
+tests/test_merge.py     # /merge 测试
+tests/test_patch.py     # /patch 测试
+tests/test_canonical.py # /canonicalize 测试
+requirements.txt        # 运行依赖（Docker 构建时自动安装）
+requirements-dev.txt    # 测试依赖
 Dockerfile
 docker-compose.yml
 ```

@@ -16,20 +16,31 @@
   operations to a deep copy of the document. Malformed requests yield 422;
   unresolvable paths, out-of-bounds array indices and failed ``test``
   operations yield 409 without any partial result.
+
+* ``POST /canonicalize`` accepts ``{"document": ...}`` and serializes the
+  document per RFC 8785 (JSON Canonicalization Scheme): object keys sorted
+  by UTF-16 code units, numbers in ECMAScript ``Number::toString`` form,
+  strings with only the mandatory escapes, and no whitespace. The response
+  carries the canonical text and the SHA-256 of its UTF-8 bytes; the same
+  document always yields byte-identical output. Missing fields, malformed
+  JSON and values that cannot be canonicalized (lone surrogates, numbers
+  outside the IEEE 754 double range) yield 422.
 """
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .canonical import CanonicalizationError, canonicalize
 from .jsonutil import MISSING, json_equal
 from .patch import PatchConflict, PatchStructureError, apply_patch
 
-app = FastAPI(title="JSON Merge & Patch Service", version="1.1.0")
+app = FastAPI(title="JSON Merge, Patch & Canonicalize Service", version="1.2.0")
 
 
 def escape_pointer(token: str) -> str:
@@ -149,6 +160,28 @@ def patch_endpoint(request: PatchRequest):
             content["path"] = exc.path
         return JSONResponse(status_code=422, content=content)
     return {"document": document}
+
+
+class CanonicalizeRequest(BaseModel):
+    document: Any = Field(...)
+
+
+@app.post("/canonicalize")
+def canonicalize_endpoint(request: CanonicalizeRequest):
+    try:
+        canonical = canonicalize(request.document)
+    except CanonicalizationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "document cannot be canonicalized",
+                "reason": str(exc),
+            },
+        )
+    return {
+        "canonical": canonical,
+        "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
 
 
 @app.get("/health")
